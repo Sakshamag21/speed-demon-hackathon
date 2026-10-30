@@ -1,0 +1,22 @@
+# Local run output
+out/
+
+# Generated datasets
+.data/
+
+# Built binaries
+*.exe
+ingest
+
+# Profiles
+*.prof
+
+# Large input logs
+*.log
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+./claude
+
+.claude/
