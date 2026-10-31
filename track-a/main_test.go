@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"os"
@@ -236,6 +237,91 @@ func TestSelectK(t *testing.T) {
 			if (i < k && v > a[k]) || (i > k && v < a[k]) {
 				t.Fatalf("it %d: partition property broken at %d", it, i)
 			}
+		}
+	}
+}
+
+// TestEndpointTable covers growth and endpoints whose hashes collide: same
+// length, same first and last 8 bytes, different middle.
+func TestEndpointTable(t *testing.T) {
+	var keys []string
+	for i := 0; i < 3000; i++ {
+		keys = append(keys, fmt.Sprintf("/aaaaaaa%05dzzzzzzzz", i)) // all collide
+	}
+	for i := 0; i < 3000; i++ {
+		keys = append(keys, fmt.Sprintf("/r%d", i)) // short, under 8 bytes
+	}
+	keys = append(keys, "/", "/a", "/aaaaaaaa", "/aaaaaaaaa")
+	var tb endpointTable
+	tb.init()
+	seen := map[string]*group{}
+	for round := 0; round < 2; round++ {
+		for _, k := range keys {
+			g := tb.get([]byte("2026-10-30T18"), []byte(k))
+			if g.key != "2026-10-30T18"+k {
+				t.Fatalf("get(%q) returned group for %q", k, g.key)
+			}
+			if prev, ok := seen[k]; ok && prev != g {
+				t.Fatalf("get(%q) returned a different group on repeat", k)
+			}
+			seen[k] = g
+		}
+	}
+	if tb.n != len(keys) {
+		t.Fatalf("table holds %d groups, want %d", tb.n, len(keys))
+	}
+}
+
+// BenchmarkScan runs scan alone, single-threaded, on the real log held in
+// memory, to measure parsing and lookup cost without disk or scheduling noise.
+func BenchmarkScan(b *testing.B) {
+	dir := os.Getenv("REQUESTS_DIR")
+	if dir == "" {
+		dir = ".."
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "requests.log"))
+	if err != nil {
+		b.Skip("no requests.log")
+	}
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := scan(bytes.NewReader(data), blockSize); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestHourIndex(t *testing.T) {
+	// Every hour of the window maps to its own offset, in order.
+	want := 0
+	for _, day := range []string{"2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"} {
+		for hh := 0; hh < 24; hh++ {
+			ts := fmt.Sprintf("%sT%02d:00:00.000000Z", day, hh)
+			inWindow := !(day == "2026-10-30" && hh < 18) && !(day == "2026-11-02" && hh >= 18)
+			got := hourIndex([]byte(ts))
+			if !inWindow {
+				if got != -1 {
+					t.Errorf("%s: got %d, want -1", ts, got)
+				}
+				continue
+			}
+			if got != want {
+				t.Errorf("%s: got %d, want %d", ts, got, want)
+			}
+			want++
+		}
+	}
+	if want != numHours {
+		t.Fatalf("window has %d hours, want %d", want, numHours)
+	}
+	for _, ts := range []string{
+		"2025-10-30T18:00:00.000000Z", "2027-10-30T18:00:00.000000Z",
+		"2026-09-30T18:00:00.000000Z", "2026-12-01T18:00:00.000000Z",
+		"2026-10-29T18:00:00.000000Z", "2026-11-03T00:00:00.000000Z",
+	} {
+		if got := hourIndex([]byte(ts)); got != -1 {
+			t.Errorf("%s: got %d, want -1", ts, got)
 		}
 	}
 }

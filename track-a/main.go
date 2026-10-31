@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -10,12 +11,14 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 )
 
 type group struct {
 	latencies []uint32
 	errors    int
+	key       string // hour prefix + endpoint; set for groups in an endpointTable
 }
 
 func main() {
@@ -214,15 +217,123 @@ func lineStart(f *os.File, pos, size int64) int64 {
 	return min(pos, size)
 }
 
-// scan aggregates every line of r. The key is the 13-byte hour prefix plus the
-// endpoint; the prefix is fixed width, so string order on the key equals
-// (hour, endpoint-as-bytes) order.
+// numHours is the span of the input: the spec fixes every timestamp between
+// 2026-10-30T18 and 2026-11-02T17 inclusive, 72 hours.
+const numHours = 72
+
+// hourIndex maps the timestamp's hour to 0..numHours-1 (2026-10-30T18 is 0),
+// or -1 if it falls outside that window. It reads the digits directly, so it
+// is injective on real dates and never gives an in-window index to another
+// hour.
+func hourIndex(ts []byte) int {
+	if string(ts[:5]) != "2026-" || ts[5] != '1' {
+		return -1
+	}
+	day := int(ts[8]-'0')*10 + int(ts[9]-'0')
+	var d int
+	switch ts[6] {
+	case '0': // October
+		d = day - 30
+	case '1': // November
+		d = day + 1
+	default:
+		return -1
+	}
+	h := d*24 + int(ts[11]-'0')*10 + int(ts[12]-'0') - 18
+	if h < 0 || h >= numHours {
+		return -1
+	}
+	return h
+}
+
+// endpointTable maps endpoint bytes to a group with open addressing and
+// linear probing. It exists because the per-line lookup dominated the scan:
+// its hash reads only the length and the first and last 8 bytes, and a hit is
+// confirmed by comparing the full endpoint, so collisions cost a probe but
+// never merge two endpoints.
+type endpointTable struct {
+	slots []*group
+	shift uint // 64 - log2(len(slots))
+	n     int
+}
+
+func (t *endpointTable) init() {
+	t.slots = make([]*group, 256)
+	t.shift = 64 - 8
+}
+
+func endpointHash(b []byte) uint64 {
+	n := len(b)
+	var lo, hi uint64
+	if n >= 8 {
+		lo = binary.LittleEndian.Uint64(b)
+		hi = binary.LittleEndian.Uint64(b[n-8:])
+	} else {
+		for _, c := range b {
+			lo = lo<<8 | uint64(c)
+		}
+	}
+	h := (lo ^ uint64(n)) * 0x9e3779b97f4a7c15
+	h ^= hi * 0xff51afd7ed558ccd
+	return h ^ h>>29
+}
+
+// get returns the group for endpoint, adding an empty one keyed by hour +
+// endpoint if it is new. Every endpoint in one table shares the same hour.
+func (t *endpointTable) get(hour, endpoint []byte) *group {
+	mask := len(t.slots) - 1
+	for i := int(endpointHash(endpoint) >> t.shift); ; i = (i + 1) & mask {
+		g := t.slots[i]
+		if g == nil {
+			var key strings.Builder // one allocation for the joined key
+			key.Grow(len(hour) + len(endpoint))
+			key.Write(hour)
+			key.Write(endpoint)
+			g = &group{key: key.String()}
+			t.slots[i] = g
+			if t.n++; t.n*2 > len(t.slots) {
+				t.grow()
+			}
+			return g
+		}
+		if g.key[hourLen:] == string(endpoint) {
+			return g
+		}
+	}
+}
+
+func (t *endpointTable) grow() {
+	old := t.slots
+	t.slots = make([]*group, 2*len(old))
+	t.shift--
+	mask := len(t.slots) - 1
+	for _, g := range old {
+		if g == nil {
+			continue
+		}
+		i := int(endpointHash([]byte(g.key[hourLen:])) >> t.shift)
+		for t.slots[i] != nil {
+			i = (i + 1) & mask
+		}
+		t.slots[i] = g
+	}
+}
+
+// scan aggregates every line of r. The result is keyed by the 13-byte hour
+// prefix plus the endpoint; the prefix is fixed width, so string order on the
+// key equals (hour, endpoint-as-bytes) order.
+//
+// While scanning, hours inside the spec's window use one small endpointTable
+// per hour keyed by the endpoint bytes alone, so no combined key is built and
+// the hot table stays cache-sized. Other hours fall back to a map on the
+// combined key.
 //
 // It reads r in blocks of blockSize and parses the complete lines of each
 // block in place; a partial last line is carried to the front of the next
 // block, and the buffer doubles if one line does not fit.
 func scan(r io.Reader, blockSize int) (map[string]*group, error) {
 	groups := make(map[string]*group)
+	var byHour [numHours]endpointTable
 	var key []byte
 	buf := make([]byte, blockSize)
 	rem := 0
@@ -262,12 +373,20 @@ func scan(r io.Reader, blockSize int) (map[string]*group, error) {
 				k++
 			}
 
-			key = append(key[:0], lines[p:p+hourLen]...)
-			key = append(key, lines[ep:j]...)
-			g := groups[string(key)]
-			if g == nil {
-				g = &group{}
-				groups[string(key)] = g
+			var g *group
+			if h := hourIndex(lines[p:]); h >= 0 {
+				t := &byHour[h]
+				if t.slots == nil {
+					t.init()
+				}
+				g = t.get(lines[p:p+hourLen], lines[ep:j])
+			} else {
+				key = append(key[:0], lines[p:p+hourLen]...)
+				key = append(key, lines[ep:j]...)
+				if g = groups[string(key)]; g == nil {
+					g = &group{}
+					groups[string(key)] = g
+				}
 			}
 			g.latencies = append(g.latencies, latency)
 			if status == '5' {
@@ -277,6 +396,13 @@ func scan(r io.Reader, blockSize int) (map[string]*group, error) {
 		}
 
 		if eof {
+			for h := range byHour {
+				for _, g := range byHour[h].slots {
+					if g != nil {
+						groups[g.key] = g
+					}
+				}
+			}
 			return groups, nil
 		}
 		rem = copy(buf, data[end:])
