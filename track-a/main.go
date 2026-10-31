@@ -107,16 +107,16 @@ func format(keys []string, groups map[string]*group) []byte {
 	out := make([]byte, 0, 80*len(keys))
 	for _, k := range keys {
 		g := groups[k]
-		slices.Sort(g.latencies)
 		n := len(g.latencies)
+		p50, p95, p99 := percentiles(g.latencies)
 		out = append(out, k[:hourLen]...)
 		out = append(out, ":00:00Z "...)
 		out = append(out, k[hourLen:]...)
 		out = append(out, ' ')
 		out = strconv.AppendInt(out, int64(n), 10)
-		for _, p := range [...]int{50, 95, 99} {
+		for _, v := range [...]uint32{p50, p95, p99} {
 			out = append(out, ' ')
-			out = strconv.AppendUint(out, uint64(g.latencies[(p*n+99)/100-1]), 10)
+			out = strconv.AppendUint(out, uint64(v), 10)
 		}
 		out = append(out, ' ')
 		out = strconv.AppendInt(out, int64(g.errors), 10)
@@ -125,6 +125,75 @@ func format(keys []string, groups map[string]*group) []byte {
 		out = append(out, '\n')
 	}
 	return out
+}
+
+// percentiles returns the nearest-rank p50, p95 and p99 of a, partially
+// reordering it. The three ranks are non-decreasing, so each selection only
+// has to look right of the previous one: selectK leaves everything before the
+// selected element no larger and everything after it no smaller.
+func percentiles(a []uint32) (p50, p95, p99 uint32) {
+	n := len(a)
+	k50, k95, k99 := (50*n+99)/100-1, (95*n+99)/100-1, (99*n+99)/100-1
+	selectK(a, k50)
+	if k95 > k50 {
+		selectK(a[k50+1:], k95-k50-1)
+	}
+	if k99 > k95 {
+		selectK(a[k95+1:], k99-k95-1)
+	}
+	return a[k50], a[k95], a[k99]
+}
+
+// selectK is quickselect: it rearranges a so that a[k] is the element a fully
+// sorted slice would hold there, with no larger element before it and no
+// smaller one after it. Median-of-three pivot, three-way partition (the
+// latencies repeat a lot), and insertion sort once the range is below 16.
+func selectK(a []uint32, k int) {
+	for len(a) > 16 {
+		lo, mid, hi := 0, len(a)/2, len(a)-1
+		if a[mid] < a[lo] {
+			a[mid], a[lo] = a[lo], a[mid]
+		}
+		if a[hi] < a[lo] {
+			a[hi], a[lo] = a[lo], a[hi]
+		}
+		if a[hi] < a[mid] {
+			a[hi], a[mid] = a[mid], a[hi]
+		}
+		pivot := a[mid]
+
+		// Invariant: a[:lt] < pivot, a[lt:i] == pivot, a[gt+1:] > pivot.
+		lt, i, gt := 0, 0, len(a)-1
+		for i <= gt {
+			switch v := a[i]; {
+			case v < pivot:
+				a[lt], a[i] = a[i], a[lt]
+				lt++
+				i++
+			case v > pivot:
+				a[i], a[gt] = a[gt], a[i]
+				gt--
+			default:
+				i++
+			}
+		}
+		switch {
+		case k < lt:
+			a = a[:lt]
+		case k > gt:
+			a, k = a[gt+1:], k-(gt+1)
+		default:
+			return // k lies in the run equal to the pivot
+		}
+	}
+	for i := 1; i < len(a); i++ {
+		v := a[i]
+		j := i
+		for ; j > 0 && a[j-1] > v; j-- {
+			a[j] = a[j-1]
+		}
+		a[j] = v
+	}
 }
 
 // lineStart returns the offset of the first line that begins at or after pos.
