@@ -115,10 +115,51 @@ func TestRandomEquivalence(t *testing.T) {
 		for i := range lines {
 			ts := fmt.Sprintf("%s:%02d:%02d.%06dZ", hours[r.Intn(len(hours))], r.Intn(60), r.Intn(60), r.Intn(1000000))
 			status := []int{200, 204, 301, 404, 500, 502, 503, 599}[r.Intn(8)]
-			lines[i] = line(ts, endpoints[r.Intn(len(endpoints))], status, r.Intn(50))
+			method := methods[r.Intn(len(methods))]
+			latency := r.Intn(50)
+			if r.Intn(20) == 0 {
+				latency = int(r.Uint32())
+			}
+			lines[i] = fmt.Sprintf("%s %s %s %d %d", ts, method, endpoints[r.Intn(len(endpoints))], status, latency)
 		}
 		if got, want := runOn(t, lines), reference(lines); got != want {
 			t.Fatalf("iteration %d: output differs", it)
+		}
+	}
+}
+
+var methods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+
+// TestScanBlocks checks that block boundaries, a line longer than the block
+// and a missing final newline do not change what scan sees.
+func TestScanBlocks(t *testing.T) {
+	r := rand.New(rand.NewSource(9))
+	var sb strings.Builder
+	for i := 0; i < 2000; i++ {
+		ep := "/" + strings.Repeat("x", r.Intn(125))
+		fmt.Fprintf(&sb, "2026-10-3%dT%02d:00:00.000000Z %s %s %d %d\n",
+			r.Intn(2), r.Intn(24), methods[r.Intn(len(methods))], ep, 200+r.Intn(400), r.Uint32())
+	}
+	in := sb.String()
+	want, err := scan(strings.NewReader(in), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range []string{in, strings.TrimSuffix(in, "\n")} {
+		for _, size := range []int{1, 7, 64, 177, 200, 4096} {
+			got, err := scan(strings.NewReader(input), size)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("block %d: %d groups, want %d", size, len(got), len(want))
+			}
+			for k, w := range want {
+				g := got[k]
+				if g == nil || g.errors != w.errors || !slices.Equal(g.latencies, w.latencies) {
+					t.Fatalf("block %d: group %q differs", size, k)
+				}
+			}
 		}
 	}
 }

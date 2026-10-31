@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"flag"
 	"fmt"
@@ -32,6 +31,9 @@ func main() {
 // hourLen is the length of "YYYY-MM-DDTHH", the hour prefix of a timestamp.
 const hourLen = 13
 
+// blockSize is how much of its range each worker reads per call.
+const blockSize = 1 << 20
+
 func run(dataDir, outDir string) error {
 	f, err := os.Open(filepath.Join(dataDir, "requests.log"))
 	if err != nil {
@@ -57,7 +59,7 @@ func run(dataDir, outDir string) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			parts[i], errs[i] = scan(io.NewSectionReader(f, bounds[i], bounds[i+1]-bounds[i]))
+			parts[i], errs[i] = scan(io.NewSectionReader(f, bounds[i], bounds[i+1]-bounds[i]), blockSize)
 		}()
 	}
 	wg.Wait()
@@ -215,41 +217,68 @@ func lineStart(f *os.File, pos, size int64) int64 {
 // scan aggregates every line of r. The key is the 13-byte hour prefix plus the
 // endpoint; the prefix is fixed width, so string order on the key equals
 // (hour, endpoint-as-bytes) order.
-func scan(r io.Reader) (map[string]*group, error) {
+//
+// It reads r in blocks of blockSize and parses the complete lines of each
+// block in place; a partial last line is carried to the front of the next
+// block, and the buffer doubles if one line does not fit.
+func scan(r io.Reader, blockSize int) (map[string]*group, error) {
 	groups := make(map[string]*group)
 	var key []byte
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 1<<16), 1<<16)
-	for sc.Scan() {
-		line := sc.Bytes()
-		// ts SP method SP endpoint SP status SP latency
-		f1 := bytes.IndexByte(line, ' ')
-		f2 := f1 + 1 + bytes.IndexByte(line[f1+1:], ' ')
-		f3 := f2 + 1 + bytes.IndexByte(line[f2+1:], ' ')
-		f4 := f3 + 1 + bytes.IndexByte(line[f3+1:], ' ')
-		endpoint := line[f2+1 : f3]
-		status := line[f3+1 : f4]
-		latency := parseUint(line[f4+1:])
-
-		key = append(key[:0], line[:hourLen]...)
-		key = append(key, endpoint...)
-		g := groups[string(key)]
-		if g == nil {
-			g = &group{}
-			groups[string(key)] = g
+	buf := make([]byte, blockSize)
+	rem := 0
+	for {
+		n, err := io.ReadFull(r, buf[rem:])
+		eof := err == io.EOF || err == io.ErrUnexpectedEOF
+		if err != nil && !eof {
+			return nil, err
 		}
-		g.latencies = append(g.latencies, latency)
-		if status[0] == '5' {
-			g.errors++
+		data := buf[:rem+n]
+		end := bytes.LastIndexByte(data, '\n') + 1
+		if eof && end < len(data) {
+			// The spec ends every line with LF; tolerate a missing last one.
+			data = append(data, '\n')
+			end = len(data)
 		}
-	}
-	return groups, sc.Err()
-}
+		if end == 0 && !eof {
+			buf = append(buf, make([]byte, len(buf))...)
+			rem = len(data)
+			continue
+		}
 
-func parseUint(b []byte) uint32 {
-	var v uint64
-	for _, c := range b {
-		v = v*10 + uint64(c-'0')
+		lines := data[:end]
+		for p := 0; p < len(lines); {
+			// ts(27) SP method(3-7) SP endpoint SP status(3) SP latency LF
+			i := p + 31
+			for lines[i] != ' ' {
+				i++
+			}
+			ep := i + 1
+			j := ep + bytes.IndexByte(lines[ep:], ' ')
+			status := lines[j+1]
+			k := j + 5
+			var latency uint32
+			for c := lines[k]; c != '\n'; c = lines[k] {
+				latency = latency*10 + uint32(c-'0')
+				k++
+			}
+
+			key = append(key[:0], lines[p:p+hourLen]...)
+			key = append(key, lines[ep:j]...)
+			g := groups[string(key)]
+			if g == nil {
+				g = &group{}
+				groups[string(key)] = g
+			}
+			g.latencies = append(g.latencies, latency)
+			if status == '5' {
+				g.errors++
+			}
+			p = k + 1
+		}
+
+		if eof {
+			return groups, nil
+		}
+		rem = copy(buf, data[end:])
 	}
-	return uint32(v)
 }
