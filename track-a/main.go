@@ -13,12 +13,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 type group struct {
 	latencies []uint32
 	errors    int
-	key       string // hour prefix + endpoint; set for groups in an endpointTable
+	key       string // hour prefix + endpoint
 }
 
 func main() {
@@ -55,7 +56,7 @@ func run(dataDir, outDir string) error {
 	}
 	bounds[workers] = st.Size()
 
-	parts := make([]map[string]*group, workers)
+	parts := make([]*scanResult, workers)
 	errs := make([]error, workers)
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -66,38 +67,54 @@ func run(dataDir, outDir string) error {
 		}()
 	}
 	wg.Wait()
-	groups := parts[0]
-	for i, p := range parts {
-		if errs[i] != nil {
-			return errs[i]
-		}
-		if i == 0 {
-			continue
-		}
-		for k, g := range p {
-			if dst := groups[k]; dst == nil {
-				groups[k] = g
-			} else {
-				dst.latencies = append(dst.latencies, g.latencies...)
-				dst.errors += g.errors
-			}
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
 
-	keys := make([]string, 0, len(groups))
-	for k := range groups {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-
-	// Each worker sorts and formats a contiguous range of the sorted keys.
-	chunks := make([][]byte, workers)
+	// The output is ordered by hour first, so every in-window hour is an
+	// independent task: gather that hour's groups from all scan workers, sort
+	// and merge them, and format them into the hour's own chunk. One more task
+	// handles the out-of-window groups, which sort before or after the window.
+	// chunks[0] is before the window, chunks[1+h] is hour h, and the last is
+	// after it.
+	chunks := make([][]byte, numHours+2)
+	var next atomic.Int32
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lo, hi := len(keys)*i/workers, len(keys)*(i+1)/workers
-			chunks[i] = format(keys[lo:hi], groups)
+			var list []*group
+			for {
+				task := int(next.Add(1) - 1)
+				if task > numHours {
+					return
+				}
+				list = list[:0]
+				if task < numHours {
+					for _, p := range parts {
+						for _, g := range p.byHour[task].slots {
+							if g != nil {
+								list = append(list, g)
+							}
+						}
+					}
+					chunks[1+task] = format(mergeSorted(list))
+					continue
+				}
+				for _, p := range parts {
+					for _, g := range p.other {
+						list = append(list, g)
+					}
+				}
+				list = mergeSorted(list)
+				split, _ := slices.BinarySearchFunc(list, windowStart, func(g *group, k string) int {
+					return strings.Compare(g.key, k)
+				})
+				chunks[0] = format(list[:split])
+				chunks[numHours+1] = format(list[split:])
+			}
 		}()
 	}
 	wg.Wait()
@@ -105,13 +122,42 @@ func run(dataDir, outDir string) error {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(outDir, "summary.txt"), slices.Concat(chunks...), 0o644)
+	out, err := os.Create(filepath.Join(outDir, "summary.txt"))
+	if err != nil {
+		return err
+	}
+	for _, c := range chunks {
+		if _, err := out.Write(c); err != nil {
+			out.Close()
+			return err
+		}
+	}
+	return out.Close()
 }
 
-func format(keys []string, groups map[string]*group) []byte {
-	out := make([]byte, 0, 80*len(keys))
-	for _, k := range keys {
-		g := groups[k]
+// mergeSorted sorts groups by key and folds groups with the same key, which
+// come from different scan workers, into the first of them. It reuses the
+// backing array of list.
+func mergeSorted(list []*group) []*group {
+	slices.SortFunc(list, func(a, b *group) int { return strings.Compare(a.key, b.key) })
+	out := list[:0]
+	for _, g := range list {
+		if n := len(out); n > 0 && out[n-1].key == g.key {
+			dst := out[n-1]
+			dst.latencies = append(dst.latencies, g.latencies...)
+			dst.errors += g.errors
+			continue
+		}
+		out = append(out, g)
+	}
+	return out
+}
+
+// format writes one summary line per group, in the order given.
+func format(list []*group) []byte {
+	out := make([]byte, 0, 80*len(list))
+	for _, g := range list {
+		k := g.key
 		n := len(g.latencies)
 		p50, p95, p99 := percentiles(g.latencies)
 		out = append(out, k[:hourLen]...)
@@ -216,6 +262,10 @@ func lineStart(f *os.File, pos, size int64) int64 {
 // 2026-10-30T18 and 2026-11-02T17 inclusive, 72 hours.
 const numHours = 72
 
+// windowStart is the hour prefix of hour 0. Out-of-window keys below it sort
+// before the window, the rest after it.
+const windowStart = "2026-10-30T18"
+
 // hourIndex maps the timestamp's hour to 0..numHours-1 (2026-10-30T18 is 0),
 // or -1 if it falls outside that window. It reads the digits directly, so it
 // is injective on real dates and never gives an in-window index to another
@@ -314,21 +364,27 @@ func (t *endpointTable) grow() {
 	}
 }
 
-// scan aggregates every line of r. The result is keyed by the 13-byte hour
+// scanResult is one scan worker's groups: one endpointTable per in-window
+// hour, and a map on the combined key for any hour outside the window.
+type scanResult struct {
+	byHour [numHours]endpointTable
+	other  map[string]*group
+}
+
+// scan aggregates every line of r. Each group's key is the 13-byte hour
 // prefix plus the endpoint; the prefix is fixed width, so string order on the
 // key equals (hour, endpoint-as-bytes) order.
 //
-// While scanning, hours inside the spec's window use one small endpointTable
-// per hour keyed by the endpoint bytes alone, so no combined key is built and
-// the hot table stays cache-sized. Other hours fall back to a map on the
-// combined key.
+// Hours inside the spec's window use one small endpointTable per hour keyed
+// by the endpoint bytes alone, so no combined key is built per line and the
+// hot table stays cache-sized. Other hours fall back to a map on the combined
+// key.
 //
 // It reads r in blocks of blockSize and parses the complete lines of each
 // block in place; a partial last line is carried to the front of the next
 // block, and the buffer doubles if one line does not fit.
-func scan(r io.Reader, blockSize int) (map[string]*group, error) {
-	groups := make(map[string]*group)
-	var byHour [numHours]endpointTable
+func scan(r io.Reader, blockSize int) (*scanResult, error) {
+	res := &scanResult{other: make(map[string]*group)}
 	var key []byte
 	buf := make([]byte, blockSize)
 	rem := 0
@@ -370,7 +426,7 @@ func scan(r io.Reader, blockSize int) (map[string]*group, error) {
 
 			var g *group
 			if h := hourIndex(lines[p:]); h >= 0 {
-				t := &byHour[h]
+				t := &res.byHour[h]
 				if t.slots == nil {
 					t.init()
 				}
@@ -378,9 +434,9 @@ func scan(r io.Reader, blockSize int) (map[string]*group, error) {
 			} else {
 				key = append(key[:0], lines[p:p+hourLen]...)
 				key = append(key, lines[ep:j]...)
-				if g = groups[string(key)]; g == nil {
-					g = &group{}
-					groups[string(key)] = g
+				if g = res.other[string(key)]; g == nil {
+					g = &group{key: string(key)}
+					res.other[g.key] = g
 				}
 			}
 			g.latencies = append(g.latencies, latency)
@@ -391,14 +447,7 @@ func scan(r io.Reader, blockSize int) (map[string]*group, error) {
 		}
 
 		if eof {
-			for h := range byHour {
-				for _, g := range byHour[h].slots {
-					if g != nil {
-						groups[g.key] = g
-					}
-				}
-			}
-			return groups, nil
+			return res, nil
 		}
 		rem = copy(buf, data[end:])
 	}

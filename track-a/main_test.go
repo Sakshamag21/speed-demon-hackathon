@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -131,6 +132,27 @@ func TestRandomEquivalence(t *testing.T) {
 
 var methods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 
+// scanGroups runs scan and returns every group it found, by key.
+func scanGroups(t testing.TB, r io.Reader, size int) map[string]*group {
+	t.Helper()
+	res, err := scan(r, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := map[string]*group{}
+	for h := range res.byHour {
+		for _, g := range res.byHour[h].slots {
+			if g != nil {
+				m[g.key] = g
+			}
+		}
+	}
+	for k, g := range res.other {
+		m[k] = g
+	}
+	return m
+}
+
 // TestScanBlocks checks that block boundaries, a line longer than the block
 // and a missing final newline do not change what scan sees.
 func TestScanBlocks(t *testing.T) {
@@ -142,16 +164,10 @@ func TestScanBlocks(t *testing.T) {
 			r.Intn(2), r.Intn(24), methods[r.Intn(len(methods))], ep, 200+r.Intn(400), r.Uint32())
 	}
 	in := sb.String()
-	want, err := scan(strings.NewReader(in), 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
+	want := scanGroups(t, strings.NewReader(in), 1<<20)
 	for _, input := range []string{in, strings.TrimSuffix(in, "\n")} {
 		for _, size := range []int{1, 7, 64, 177, 200, 4096} {
-			got, err := scan(strings.NewReader(input), size)
-			if err != nil {
-				t.Fatal(err)
-			}
+			got := scanGroups(t, strings.NewReader(input), size)
 			if len(got) != len(want) {
 				t.Fatalf("block %d: %d groups, want %d", size, len(got), len(want))
 			}
