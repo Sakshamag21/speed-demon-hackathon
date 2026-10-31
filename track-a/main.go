@@ -148,11 +148,6 @@ func percentiles(a []uint32) (p50, p95, p99 uint32) {
 	}
 	return a[k50], a[k95], a[k99]
 }
-
-// selectK is quickselect: it rearranges a so that a[k] is the element a fully
-// sorted slice would hold there, with no larger element before it and no
-// smaller one after it. Median-of-three pivot, three-way partition (the
-// latencies repeat a lot), and insertion sort once the range is below 16.
 func selectK(a []uint32, k int) {
 	for len(a) > 16 {
 		lo, mid, hi := 0, len(a)/2, len(a)-1
